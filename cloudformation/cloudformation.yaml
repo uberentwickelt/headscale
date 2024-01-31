@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "headscale in spot instance"
+Parameters:
+  AMI:
+    Default: "ami-0c758b376a9cf7862" # debian-12-arm64-20231013-1532
+    Description: "Launch Template AMI ID"
+    Type: String
+  DomainName:
+    Description: "Domain name to host headscale at"
+    Type: String
+  LaunchTemplateUserData:
+    Description: "Launch Template User Data (must be provided as base64 encoded string)"
+    Type: String
+  Name:
+    Default: "headscale"
+    Description: "Name of or to prepend to these resources"
+    Type: String
+  Subnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: A list of subnets for the Auto Scaling group
+  SystemTag:
+    Default: "SYSTEM_TAG"
+    Description: "Key to use when tagging resources"
+    Type: String
+  VPC:
+    Description: "VPC ID to deploy into"
+    Type: String
+Resources:
+  LambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-27"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Description: "Role enabling headscale config update lambda"
+      MaxSessionDuration: 3600
+      Path: /
+      Policies:
+        - PolicyName: "allowSendCommand"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "sendCommand"
+                Effect: Allow
+                Action:
+                  - "ssm:SendCommand"
+                Resource:
+                  - "arn:aws:ssm:*:*:document/headscale-RunCommand"
+                  - "arn:aws:ec2:*:*:instance/*"
+              - Sid: "sendCommand2"
+                Effect: Allow
+                Action:
+                  - "ssm:SendCommand"
+                Resource:
+                  - "arn:aws:ssm:*:*:document/*"
+                  - "arn:aws:ec2:*:*:instance/*"
+        - PolicyName: "LambdaBasicExecution"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "createLogGroup"
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Sid: "logStreamAndPutEvents"
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Name}*:*"
+      RoleName: !Sub "${Name}_lambda_role"
+  InstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-27"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Description: !Sub "Role enabling ${Name} spot instances"
+      MaxSessionDuration: 3600
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        - "arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess"
+      Policies:
+        - PolicyName: "deleteObjectVersion"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "deleteSQLiteDB"
+                Effect: Allow
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:DeleteObjectVersion"
+                Resource: !Sub "arn:aws:s3:::${domainName}/var/lib/headscale/db.sqlite"
+        - PolicyName: "describeTags"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "readTags"
+                Effect: Allow
+                Action:
+                  - "ec2:DescribeTags"
+                Resource: "*"
+        - PolicyName: "getParameters"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "getParameters"
+                Effect: Allow
+                Action:
+                  - "ssm:GetParameter"
+                Resource: !Sub "arn:aws:ssm:${AWS:Region}:${AWS::AccountId}:parameter/${Name}*"
+        - PolicyName: "getS3Objects"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "getObjects"
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                Resource: 
+                  - !Sub "arn:aws:s3:::${domainName}/etc/*"
+                  - !Sub "arn:aws:s3:::${domainName}/setup.sh"
+                  - !Sub "arn:aws:s3:::${domainName}/var/lib/headscale/*"
+                  - !Sub "arn:aws:s3:::${domainName}/usr/local/bin/*"
+              - Sid: "allowRecursiveCopy"
+                Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:ListBucketVersions"
+                Resource: !Sub "arn:aws:s3:::${domainName}"
+        - PolicyName: "putS3Objects"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "putS3Objects"
+                Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                Resource: !Sub "arn:aws:s3:::${domainName}/var/lib/headscale/*"
+      RoleName: !Sub "${Name}_instance_role"
+  SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: !Sub "${Name} SG"
+      GroupName: !Sub "${Name}"
+      SecurityGroupEgress: 
+        - IpProtocol: All
+          FromPort: 1
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress: 
+        - CidrIp: 0.0.0.0/0
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIp: 0.0.0.0/0
+          FromPort: 8443
+          IpProtocol: tcp
+          ToPort: 8443
+      VpcId: !Sub "${VPC}"
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - InstanceRole
+      - SecurityGroup
+    Properties:
+      LaunchTemplateData:
+        CreditSpecification: 
+          CpuCredits: "standard"
+        IamInstanceProfile: !GetAtt "InstanceRole.Arn"
+        ImageId: !Sub "${AMI}"
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            SpotInstanceType: one-time # For use with AutoScalingGroups
+        InstanceType: t4g.micro
+        # KeyName: !Sub "${Name}"
+        MetadataOptions:
+          HttpTokens: "required"
+        # NetworkInterfaces: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-networkinterface.html
+        SecurityGroupIDs: 
+          - !GetAtt "SecurityGroup.GroupId"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: !Sub "${SystemTag}"
+                Value: !Sub "${Name}"
+        UserData: !Sub "${LaunchTemplateUserData}"
+      LaunchTemplateName: !Sub "${Name}"
+      TagSpecifications: 
+        - ResourceType: instance
+          Tags:
+            - Key: !Sub "${SystemTag}"
+              Value: !Sub "${Name}"
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - LaunchTemplate
+      - InstanceRole
+      - SecurityGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${Name}"
+      AvailabilityZones:
+        - String
+      CapacityRebalance: true
+      DefaultInstanceWarmup: 5
+      DesiredCapacity: "1"
+      DesitredCapacityType: "Units"
+      HealthCheckGracePeriod: 300
+      # HealthCheckType: "EC2" # EC2 is the default type and may not be disabled. Only set this if you must clear a value that was previously set. https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-autoscaling-autoscalinggroup.html
+      MaxSize: "1"
+      MinSize: "0"
+      MixedInstancesPolicy:
+        InstancesDistribution:
+            SpotAllocationStrategy: "lowest-price"
+            SpotInstancePools: 2
+        LaunchTemplate:
+          LaunchTemplateId: !Ref LaunchTemplate
+          Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      NewInstancesProtectedFromScaleIn: false
+      Tags:
+        - Key: !Sub "${SystemTag}"
+          PropagateAtLaunch: true
+          Value: !Sub "${Name}"
+      TerminationPolicies:
+        - Default
+      VPCZoneIdentifier: !Ref Subnets
