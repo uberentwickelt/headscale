@@ -9,14 +9,16 @@ function get_parameter {
     echo "$(aws ssm get-parameter --name ${1} --with-decryption --query "Parameter.Value" --output text)"
 }
 
+app_name="headscale"
+
 # Main
 # Get parameters
-acme_email=$(get_parameter "headscale_acme_email")
-cf_key=$(get_parameter "headscale_cloudflare_key")
-domain_name=$(get_parameter "headscale_domain_name")
-headscale_bucket=$(get_parameter "headscale_bucket")
-headscale_version=$(get_parameter "headscale_version")
-zone_identifier=$(get_parameter "headscale_cloudflare_zone_identifier")
+acme_email=$(get_parameter "${app_name}_acme_email")
+#cf_key=$(get_parameter "${app_name}_cloudflare_key")
+domain_name=$(get_parameter "${app_name}_domain_name")
+headscale_bucket=$(get_parameter "${app_name}_bucket")
+headscale_version=$(get_parameter "${app_name}_version")
+#zone_identifier=$(get_parameter "${app_name}_cloudflare_zone_identifier")
 
 # Get headscale debian package file, and install headscale
 curl -Lo headscale.deb "https://github.com/juanfont/headscale/releases/download/v${headscale_version}/headscale_${headscale_version}_linux_arm64.deb"
@@ -39,9 +41,10 @@ sed -i "s/^\ \ acme_email:.*$/  acme_email: \"${acme_email}\"/g" /etc/headscale/
 sed -i "s/^\ \ tls_letsencrypt_hostname:.*$/  tls_letsencrypt_hostname: \"${domain_name}\"/g" /etc/headscale/config.yaml
 
 ### Update the CNAME record in cloudflare
-identifier=$(curl -fsSL --request GET --url "https://api.cloudflare.com/client/v4/zones/${zone_identifier}/dns_records?name=${domain_name}" --header 'Content-Type: application/json' --header "Authorization: Bearer $cf_key"|jq ".result[0].id"|sed 's/"//g')
-data='{"content":"'$(ec2-metadata --public-hostname|awk '{print $2}')'","name": "'${domain_name}'","type": "CNAME","proxied": false}'
-curl --request PUT --url "https://api.cloudflare.com/client/v4/zones/${zone_identifier}/dns_records/${identifier}" --header 'Content-Type: application/json' --header "Authorization: Bearer ${cf_key}" --data "${data}"
+#identifier=$(curl -fsSL --request GET --url "https://api.cloudflare.com/client/v4/zones/${zone_identifier}/dns_records?name=${domain_name}" --header 'Content-Type: application/json' --header "Authorization: Bearer $cf_key"|jq ".result[0].id"|sed 's/"//g')
+#data='{"content":"'$(ec2-metadata --public-hostname|awk '{print $2}')'","name": "'${domain_name}'","type": "CNAME","proxied": false}'
+#curl --request PUT --url "https://api.cloudflare.com/client/v4/zones/${zone_identifier}/dns_records/${identifier}" --header 'Content-Type: application/json' --header "Authorization: Bearer ${cf_key}" --data "${data}"
+aws lambda invoke --function-name "${app_name}_update_dns" --payload '{ "hostname": "$(ec2-metadata --public-hostname|awk '{print $2}')" }' --cli-binary-format raw-in-base64-out /dev/null
 
 # Backup changes to the following files (keys) when/if changes are made
 # Do NOT backup the db.sqlite database file based on "changes" with inotify
@@ -65,18 +68,18 @@ dpkg -i amazon-ssm-agent.deb
 systemctl enable --now amazon-ssm-agent
 
 # Cleanup
-cf_key=""
-data=""
+#cf_key=""
+#data=""
 domain_name=""
 headscale_bucket=""
 headscale_version=""
-identifier=""
-zone_identifier=""
+#identifier=""
+#zone_identifier=""
 unset cf_key
-unset data
+#unset data
 unset domain_name
 unset headscale_bucket
 unset headscale_version
-unset identifier
-unset zone_identifier
+#unset identifier
+#unset zone_identifier
 rm -f ./*.deb /tmp/setup.sh

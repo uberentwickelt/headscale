@@ -455,7 +455,7 @@ Resources:
         TargetArn: !GetAtt DeadLetterQueue.Arn
       Environment:
         Variables:
-          Example: "Value"
+          APP_NAME: !Sub "${Name}"
       EphemeralStorage:
         Size: 512
       FunctionName: !Sub "${Name}_update_dns"
