@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: "headscale in spot instance"
+Description: "headscale using spot instances"
 Parameters:
   AMI:
     Default: "ami-0c758b376a9cf7862" # debian-12-arm64-20231013-1532
@@ -15,6 +15,10 @@ Parameters:
     Default: "headscale"
     Description: "Name of or to prepend to these resources"
     Type: String
+  Runtime:
+    Default: "python3.11"
+    Description: "Runtime for lambda functions"
+    Type: String
   Subnets:
     Type: 'List<AWS::EC2::Subnet::Id>'
     Description: A list of subnets for the Auto Scaling group
@@ -26,8 +30,13 @@ Parameters:
     Description: "VPC ID to deploy into"
     Type: String
 Resources:
-  LambdaRole:
-    Type: "AWS::IAM::Role"
+  IAMGrootAdmin:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: !Sub "${Name}-Admin"
+      Path: "/"
+  LambdaConfigRefreshRole:
+    Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-27"
@@ -38,7 +47,7 @@ Resources:
                 - "lambda.amazonaws.com"
             Action:
               - "sts:AssumeRole"
-      Description: "Role enabling headscale config update lambda"
+      Description: "Enables a lambda function to update headscale's config and acls without launching a new instance"
       MaxSessionDuration: 3600
       Path: /
       Policies:
@@ -75,9 +84,47 @@ Resources:
                   - "logs:CreateLogStream"
                   - "logs:PutLogEvents"
                 Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Name}*:*"
-      RoleName: !Sub "${Name}_lambda_role"
+      RoleName: !Sub "${Name}_config_refresh"
+      Tags:
+        - Key: !Sub "${SystemTag}"
+          Value: !Sub "${Name}"
+  LambdaUpdateDnsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-27"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Description: "Enables a lambda function to update headscale dns record"
+      MaxSessionDuration: 3600
+      Path: /
+      Policies:
+        - PolicyName: "LambdaBasicExecution"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "createLogGroup"
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Sid: "logStreamAndPutEvents"
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Name}*:*"
+      RoleName: !Sub "${Name}_update_dns"
+      Tags:
+        - Key: !Sub "${SystemTag}"
+          Value: !Sub "${Name}"
   InstanceRole:
-    Type: "AWS::IAM::Role"
+    Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-27"
@@ -104,7 +151,7 @@ Resources:
                 Action:
                   - "s3:DeleteObject"
                   - "s3:DeleteObjectVersion"
-                Resource: !Sub "arn:aws:s3:::${domainName}/var/lib/headscale/db.sqlite"
+                Resource: !Sub "arn:aws:s3:::${DomainName}/var/lib/headscale/db.sqlite"
         - PolicyName: "describeTags"
           PolicyDocument:
             Version: "2012-10-17"
@@ -132,16 +179,16 @@ Resources:
                 Action:
                   - "s3:GetObject"
                 Resource: 
-                  - !Sub "arn:aws:s3:::${domainName}/etc/*"
-                  - !Sub "arn:aws:s3:::${domainName}/setup.sh"
-                  - !Sub "arn:aws:s3:::${domainName}/var/lib/headscale/*"
-                  - !Sub "arn:aws:s3:::${domainName}/usr/local/bin/*"
+                  - !Sub "arn:aws:s3:::${DomainName}/etc/*"
+                  - !Sub "arn:aws:s3:::${DomainName}/setup.sh"
+                  - !Sub "arn:aws:s3:::${DomainName}/var/lib/headscale/*"
+                  - !Sub "arn:aws:s3:::${DomainName}/usr/local/bin/*"
               - Sid: "allowRecursiveCopy"
                 Effect: Allow
                 Action:
                   - "s3:ListBucket"
                   - "s3:ListBucketVersions"
-                Resource: !Sub "arn:aws:s3:::${domainName}"
+                Resource: !Sub "arn:aws:s3:::${DomainName}"
         - PolicyName: "putS3Objects"
           PolicyDocument:
             Version: "2012-10-17"
@@ -150,18 +197,110 @@ Resources:
                 Effect: Allow
                 Action:
                   - "s3:PutObject"
-                Resource: !Sub "arn:aws:s3:::${domainName}/var/lib/headscale/*"
+                Resource: !Sub "arn:aws:s3:::${DomainName}/var/lib/headscale/*"
       RoleName: !Sub "${Name}_instance_role"
+      Tags:
+        - Key: !Sub "${SystemTag}"
+          Value: !Sub "${Name}"
+  KMSKey:
+    Type: AWS::KMS::Key
+    DependsOn:
+      - IAMGrootAdmin
+      - InstanceRole
+      - LambdaUpdateDnsRole
+    Properties:
+      BypassPolicyLockoutSafetyCheck: false
+      Enabled: true
+      EnableKeyRotation: false
+      KeyPolicy: 
+        Version: "2012-10-17"
+        Id: "key-consolepolicy"
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: "Allow access for Key Administrators"
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt IAMGrootAdmin.Arn
+            Action:
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+            Resource: "*"
+          - Sid: "Allow use of the key"
+            Effect: Allow
+            Principal:
+              AWS: 
+                - !GetAtt IAMGrootAdmin.Arn
+                - !GetAtt InstanceRole.Arn
+                - !GetAtt LambdaUpdateDnsRole.Arn
+            Action:
+              - "kms:Decrypt"
+              - "kms:DescribeKey"
+              - "kms:Encrypt"
+              - "kms:ReEncrypt"
+              - "kms:GenerateDataKey"
+            Resource: "*"
+          - Sid: "Allow attachment of persistent resources"
+            Effect: Allow
+            Principal:
+              AWS: 
+                - !GetAtt IAMGrootAdmin.Arn
+                - !GetAtt InstanceRole.Arn
+                - !GetAtt LambdaUpdateDnsRole.Arn
+            Action:
+              - "kms:CreateGrant"
+              - "kms:ListGrants"
+              - "kms:RevokeGrant"
+            Resource: "*"
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: "true"
+      KeySpec: "SYMMETRIC_DEFAULT"
+      KeyUsage: "ENCRYPT_DECRYPT"
+      MultiRegion: false
+      Origin: "AWS_KMS"
+      PendingWindowInDays: 7
+      Tags:
+        - Key: !Sub "${SystemTag}"
+          Value: !Sub "${Name}"
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    DependsOn:
+      - KMSKey
+    Properties:
+      AliasName: !Sub "alias/${Name}"
+      TargetKeyId: !Ref KMSKey
   SecurityGroup:
-    Type: "AWS::EC2::SecurityGroup"
+    Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: !Sub "${Name} SG"
       GroupName: !Sub "${Name}"
       SecurityGroupEgress: 
-        - IpProtocol: All
+        - CidrIp: 0.0.0.0/0
+          CidrIpv6: ::/0
           FromPort: 1
+          IpProtocol: All
           ToPort: 65535
-          CidrIp: 0.0.0.0/0
+        - CidrIpv6: ::/0
+          FromPort: 1
+          IpProtocol: All
+          ToPort: 65535
       SecurityGroupIngress: 
         - CidrIp: 0.0.0.0/0
           FromPort: 443
@@ -171,51 +310,68 @@ Resources:
           FromPort: 8443
           IpProtocol: tcp
           ToPort: 8443
+        - CidrIpv6: ::/0
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIpv6: ::/0
+          FromPort: 8443
+          IpProtocol: tcp
+          ToPort: 8443
+      Tags:
+        - Key: !Sub "${SystemTag}"
+          Value: !Sub "${Name}"
       VpcId: !Sub "${VPC}"
+  KeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyFormat: "pem"
+      KeyName: !Sub "${Name}"
+      KeyType: "ed25519"
+      Tags:
+        - Key: !Sub "${SystemTag}"
+          Value: !Sub "${Name}"
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     DependsOn:
+      - KeyPair
       - InstanceRole
       - SecurityGroup
     Properties:
       LaunchTemplateData:
         CreditSpecification: 
           CpuCredits: "standard"
-        IamInstanceProfile: !GetAtt "InstanceRole.Arn"
+        IamInstanceProfile: !GetAtt InstanceRole.Arn
         ImageId: !Sub "${AMI}"
         InstanceMarketOptions:
           MarketType: spot
           SpotOptions:
             SpotInstanceType: one-time # For use with AutoScalingGroups
         InstanceType: t4g.micro
-        # KeyName: !Sub "${Name}"
+        KeyName: !Ref KeyPair
         MetadataOptions:
           HttpTokens: "required"
         # NetworkInterfaces: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-networkinterface.html
         SecurityGroupIDs: 
-          - !GetAtt "SecurityGroup.GroupId"
+          - !GetAtt SecurityGroup.GroupId
         TagSpecifications:
           - ResourceType: instance
             Tags:
               - Key: !Sub "${SystemTag}"
                 Value: !Sub "${Name}"
-        UserData: !Sub "${LaunchTemplateUserData}"
+        UserData: !Ref LaunchTemplateUserData
       LaunchTemplateName: !Sub "${Name}"
       TagSpecifications: 
         - ResourceType: instance
           Tags:
             - Key: !Sub "${SystemTag}"
               Value: !Sub "${Name}"
-  ASG:
+  AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn:
       - LaunchTemplate
-      - InstanceRole
-      - SecurityGroup
     Properties:
       AutoScalingGroupName: !Sub "${Name}"
-      AvailabilityZones:
-        - String
       CapacityRebalance: true
       DefaultInstanceWarmup: 5
       DesiredCapacity: "1"
@@ -227,7 +383,7 @@ Resources:
       MixedInstancesPolicy:
         InstancesDistribution:
             SpotAllocationStrategy: "lowest-price"
-            SpotInstancePools: 2
+            SpotInstancePools: 2 # 2 is the minimum allowed value
         LaunchTemplate:
           LaunchTemplateId: !Ref LaunchTemplate
           Version: !GetAtt LaunchTemplate.LatestVersionNumber
@@ -239,3 +395,125 @@ Resources:
       TerminationPolicies:
         - Default
       VPCZoneIdentifier: !Ref Subnets
+  DeadLetterQueue:
+    Type: AWS::SQS:Queue
+    Properties:
+      QueueName: !Sub "${Name}-DeadLetterQueue"
+      SqsManagedSseEnabled: true
+  LambdaConfigRefresh:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - DeadLetterQueue
+      - LambdaConfigRefreshRole
+    Properties:
+      Architectures:
+        - "arm64"
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: "config_refresh.zip"
+      Description: "This function updates headscale's config and acls in place and reloads headscale"
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          Example: "Value"
+      EphemeralStorage:
+        Size: 512
+      FunctionName: !Sub "${Name}_config_refresh"
+      Handler: "config_refresh.lambda_handler"
+      MemorySize: 128
+      Role: !GetAtt LambdaConfigRefreshRole.Arn
+      Runtime: !Ref Runtime
+      PackageType: Zip
+      Timeout: 5
+      Tags:
+        - Key: !Sub "${SystemTag}"
+          Value: !Sub "${Name}"
+  LambdaConfigRefreshPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - LambdaConfigRefresh
+      - ConfigBucket
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaConfigRefresh.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ConfigBucket.Arn
+  LambdaUpdateDns:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - DeadLetterQueue
+      - LambdaUpdateDnsRole
+    Properties:
+      Architectures:
+        - "arm64"
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: "update_dns.zip"
+      Description: "This function updates headscale's dns record in provider"
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          Example: "Value"
+      EphemeralStorage:
+        Size: 512
+      FunctionName: !Sub "${Name}_update_dns"
+      Handler: "update_dns.lambda_handler"
+      MemorySize: 128
+      Role: !GetAtt LambdaUpdateDnsRole.Arn
+      Runtime: !Ref Runtime
+      PackageType: Zip
+      Timeout: 5
+      Tags:
+        - Key: !Sub "${SystemTag}"
+          Value: !Sub "${Name}"
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - LambdaConfigRefresh
+    Properties:
+      AccessControl: Private
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+          BucketKeyEnabled: true
+          ServerSideEncryptionByDefault:
+            SSEAlgorithm: "aws:kms"
+      BucketName: !Sub "${DomainName}"
+      LifecycleConfiguration: 
+        Rules:
+          - Id: "delete previous versions of db"
+            NoncurrentVersionExpiration: 
+              NewerNoncurrentVersions: 5
+              NoncurrentDays: 1
+            Prefix: "var/lib/headscale/db.sqlite"
+            Status: "Enabled"
+      NotificationConfiguration: 
+        EventBridgeConfiguration:
+          EventBridgeEnabled: false
+        LambdaConfigurations:
+          - Event: 
+              - s3:ObjectCreated:Put
+              - s3:ObjectCreated:Post
+              - s3:ObjectCreated:Copy
+              - s3:ObjectRestore:Completed
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "etc/headscale"
+            Function: !GetAtt LambdaConfigRefresh.Arn
+      ObjectLockEnabled: false
+      OwnershipControls: 
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration: 
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: !Sub "${SystemTag}"
+          Value: !Sub "${Name}"
+      VersioningConfiguration: 
+        Status: Enabled
